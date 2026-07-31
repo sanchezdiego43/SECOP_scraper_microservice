@@ -19,6 +19,14 @@ class ScrapeRequest(BaseModel):
     url: str
 
 
+@app.get("/")
+def root():
+    # Algunas plataformas (como EasyPanel) revisan esta dirección para
+    # confirmar que el servicio sigue "vivo". Si no responde aquí, pueden
+    # reiniciar el contenedor pensando que se cayó.
+    return {"status": "ok"}
+
+
 @app.get("/health")
 def health():
     # Puerta simple para comprobar que el servicio está vivo.
