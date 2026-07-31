@@ -29,8 +29,8 @@ WHAT DOES THIS SCRIPT DO, IN PLAIN WORDS?
        FINAL TABLE ROW we want to store in a database:
            - numero_de_proceso          (str, used to JOIN with an API)
            - informacion_cumplimiento    (dict -> stored as JSON/JSONB)
-           - responsabilidad_civil_contractual     (dict or "N/A")
-           - responsabilidad_civil_extracontractual (str: "Si"/"No")
+           - responsabilidad_civil_extracontractual (dict -> stored as
+             JSON/JSONB; see the note on that function below)
 
 WHY DOES THE CAPTCHA PART LOOK COMPLICATED?
 
@@ -80,6 +80,24 @@ DICTIONARY WITH MANY KEYS?
     maps naturally to a JSON / JSONB column in a database. This keeps
     the table narrow and still fully queryable.
 
+    The exact same reasoning applies to civil liability
+    (extracontractual): a process can show its value in up to 3
+    different, mutually-independent rows (money + currency, a
+    percentage, or a number of SMMLV), so those are grouped into a
+    nested "valores" dict too instead of separate flat columns.
+
+WHY DOES CIVIL LIABILITY (EXTRACONTRACTUAL) CHECK EXISTENCE INSTEAD OF
+VISIBILITY?
+
+    The page always injects a #spnCivilLiabilityFieldTrue element, but
+    only actually shows it (via CSS/JS) when the process HAS this
+    guarantee. Checking .is_visible() on both the "true" and "false"
+    spans turned out to be unreliable - likely because the toggle
+    happens through a JS/class change that can be a step behind at the
+    exact instant Playwright reads it. Simply checking whether
+    #spnCivilLiabilityFieldTrue EXISTS in the DOM at all is a more
+    direct, reliable signal.
+
 Requirements to run this script:
     pip install playwright requests pandas
     playwright install chromium
@@ -88,8 +106,9 @@ Requirements to run this script:
 NOTES ADDED FOR THE VPS / MICROSERVICE VERSION (read this once):
 --------------------------------------------------------------------
 This file runs inside a Docker container on a VPS, called by app.py
-every time n8n asks for a scrape. Same two changes as before, each
-marked with a "VPS CHANGE" comment right above the modified line:
+every time n8n asks for a scrape. Two changes from the original local
+version, each marked with a "VPS CHANGE" comment right above the
+modified line:
 
   1. TWOCAPTCHA_API_KEY is read from an environment variable instead
      of being written directly in the code, so the real secret never
@@ -97,6 +116,10 @@ marked with a "VPS CHANGE" comment right above the modified line:
 
   2. headless=False became headless=True, since the VPS has no screen
      attached and can't physically open a visible browser window.
+     locale="es-CO" and an Accept-Language header were also added, to
+     recreate the "Spanish browser" signal that Windows gave for free
+     locally - without it, the page falls back to English and the
+     dynamic compliance labels come back in English instead of Spanish.
 
 TARGET_URL and the `if __name__ == "__main__":` block (including
 row_to_dataframe) are still here, but only matter if you run this
@@ -145,18 +168,31 @@ REQUEST_REFERENCE_SELECTOR = (
     "#fdsRequestSummaryInfo_tblDetail_trRowRef_tdCell2_spnRequestReference"
 )
 
-# --- Civil liability (extracontractual): Si/No flag ---
-CIVIL_LIABILITY_YES_SELECTOR = "#spnCivilLiabilityFieldTrue"
-CIVIL_LIABILITY_NO_SELECTOR = "#spnCivilLiabilityFieldFalse"
+# --- Civil liability (extracontractual) ---
+# Presence of this element (not just visibility) is what tells us the
+# process HAS this guarantee at all. See the module docstring above
+# for why we check existence instead of comparing visibility of a
+# "true" vs "false" span.
+CIVIL_LIABILITY_HAS_IT_SELECTOR = "#spnCivilLiabilityFieldTrue"
 
-# --- Civil liability (contractual): unit + value ---
-# The unit label (e.g. "No. de SMMLV") is a <label for="..."> element,
-# not an element with its own "lbl..." id, so we match it by its
-# "for" attribute instead of the usual "starts with lbl" pattern.
-CIVIL_LIABILITY_CONTRACTUAL_UNIT_SELECTOR = (
-    'label[for="tdCivilLiabilityMinWagesRBCell_rdbCivilLiabilityMinWagesRB"]'
-)
-CIVIL_LIABILITY_CONTRACTUAL_VALUE_SELECTOR = "#nbxCivilLiabilityMinWagesField"
+# Up to 3 independent rows can hold the actual value, depending on how
+# the process defines this guarantee. Each row is checked separately
+# because a process may show one, more than one, or none of them.
+CIVIL_LIABILITY_VALUE_ROW_SELECTOR = "#trCivilLiabilityValueRow"
+CIVIL_LIABILITY_VALUE_FIELD_SELECTOR = "#cbxCivilLiabilityValueField"
+CIVIL_LIABILITY_VALUE_CURRENCY_SELECTOR = "#txtCivilLiabilityValueCurrency"
+
+# TODO: the percentage row is detected (exists/visible check works),
+# but the exact id of the field that holds the actual percentage
+# number hasn't been confirmed yet on a real process. Once you find a
+# process that has this row populated, inspect it and fill in
+# CIVIL_LIABILITY_PERCENTAGE_FIELD_SELECTOR below, then uncomment the
+# corresponding block inside read_civil_liability_extracontractual().
+CIVIL_LIABILITY_PERCENTAGE_ROW_SELECTOR = "#trCivilLiabilityPercentageRow"
+# CIVIL_LIABILITY_PERCENTAGE_FIELD_SELECTOR = "#???"
+
+CIVIL_LIABILITY_MIN_WAGES_ROW_SELECTOR = "#trCivilLiabilityMinWagesRow"
+CIVIL_LIABILITY_MIN_WAGES_FIELD_SELECTOR = "#nbxCivilLiabilityMinWagesField"
 
 # ==================================================================
 # COMPLIANCE / GUARANTEE GROUPS (dynamic fields)
@@ -349,48 +385,64 @@ def clean_process_number(raw_text: str | None) -> str | None:
     return raw_text.strip()
 
 
-def read_civil_liability_extracontractual(page) -> str | None:
+def read_civil_liability_extracontractual(page) -> dict:
     """
-    The page always has TWO hidden spans ready for this question:
-    one that says "Si" and one that (would say) "No" - but only ONE
-    of the two is actually shown at a time; the other stays hidden
-    with a "display:none" style.
+    Reads the "Responsabilidad civil extracontractual" guarantee.
 
-    So instead of reading text, we check WHICH of the two is visible.
+    Step 1: does the process have this guarantee at all? We check
+    whether #spnCivilLiabilityFieldTrue EXISTS in the DOM (not just
+    whether it's "visible" - see the module docstring for why).
+    If it doesn't exist, we return "No" right away with "valores": "N/A",
+    without bothering to check any of the value rows.
+
+    Step 2: if it DOES exist, we check up to 3 independent rows that
+    can each optionally hold a value, since a process might express
+    this guarantee as money+currency, a percentage, and/or a number of
+    SMMLV (minimum wages) - any combination is possible. Each row is
+    checked for existence + visibility before reading its field(s), the
+    same pattern used for the compliance groups above. Whatever rows
+    are actually present get merged into a single "valores" dict.
+
+    Returns:
+        {
+            "tiene_responsabilidad_civil_extracontractual": "Si" | "No",
+            "valores": dict | "N/A",
+        }
     """
-    yes_span = page.query_selector(CIVIL_LIABILITY_YES_SELECTOR)
-    no_span = page.query_selector(CIVIL_LIABILITY_NO_SELECTOR)
+    has_civil_liability = page.query_selector(CIVIL_LIABILITY_HAS_IT_SELECTOR) is not None
 
-    if yes_span is not None and yes_span.is_visible():
-        return "Si"
-    if no_span is not None and no_span.is_visible():
-        return "No"
-    return None
+    if not has_civil_liability:
+        return {
+            "tiene_responsabilidad_civil_extracontractual": "No",
+            "valores": "N/A",
+        }
 
+    valores = {}
 
-def read_civil_liability_contractual(page) -> dict | str:
-    """
-    Reads the "Responsabilidad civil contractual" unit + value.
+    # --- Row 1: money value + currency ---
+    value_row = page.query_selector(CIVIL_LIABILITY_VALUE_ROW_SELECTOR)
+    if value_row is not None and value_row.is_visible():
+        valores["Valor"] = {
+            "valor": read_text(page, CIVIL_LIABILITY_VALUE_FIELD_SELECTOR),
+            "moneda": read_text(page, CIVIL_LIABILITY_VALUE_CURRENCY_SELECTOR),
+        }
 
-    Returns a dict like {"unidad": "No. de SMMLV", "valor": "500"} when
-    the process defines this guarantee, or the string "N/A" when it
-    doesn't apply to this process (no value present on the page).
+    # --- Row 2: percentage ---
+    # Not implemented yet - the row's existence is detected, but the
+    # exact id of the percentage field itself is still unknown (see
+    # the TODO next to CIVIL_LIABILITY_PERCENTAGE_ROW_SELECTOR above).
+    # percentage_row = page.query_selector(CIVIL_LIABILITY_PERCENTAGE_ROW_SELECTOR)
+    # if percentage_row is not None and percentage_row.is_visible():
+    #     valores["Porcentaje"] = read_text(page, CIVIL_LIABILITY_PERCENTAGE_FIELD_SELECTOR)
 
-    NOTE: this currently reads the SMMLV-based value field
-    (#nbxCivilLiabilityMinWagesField). If a given process instead
-    expresses this guarantee directly in pesos (a different field id),
-    that alternate selector isn't wired in yet - let me know the exact
-    id if you run into that case and I'll add it as a second check.
-    """
-    value = read_text(page, CIVIL_LIABILITY_CONTRACTUAL_VALUE_SELECTOR)
-    if not value:
-        return "N/A"
-
-    unit_label = read_text(page, CIVIL_LIABILITY_CONTRACTUAL_UNIT_SELECTOR)
+    # --- Row 3: number of SMMLV (minimum wages) ---
+    min_wages_row = page.query_selector(CIVIL_LIABILITY_MIN_WAGES_ROW_SELECTOR)
+    if min_wages_row is not None and min_wages_row.is_visible():
+        valores["# de SMMLV"] = read_text(page, CIVIL_LIABILITY_MIN_WAGES_FIELD_SELECTOR)
 
     return {
-        "unidad": unit_label,
-        "valor": value,
+        "tiene_responsabilidad_civil_extracontractual": "Si",
+        "valores": valores if valores else "N/A",
     }
 
 
@@ -469,8 +521,10 @@ def scrape_secop_process(url: str) -> dict:
         {
             "numero_de_proceso": str | None,
             "informacion_cumplimiento": dict,
-            "responsabilidad_civil_contractual": dict | "N/A",
-            "responsabilidad_civil_extracontractual": "Si" | "No" | None,
+            "responsabilidad_civil_extracontractual": {
+                "tiene_responsabilidad_civil_extracontractual": "Si" | "No",
+                "valores": dict | "N/A",
+            },
         }
     """
     with sync_playwright() as p:
@@ -548,7 +602,6 @@ def scrape_secop_process(url: str) -> dict:
         row = {
             "numero_de_proceso": clean_process_number(raw_reference),
             "informacion_cumplimiento": build_compliance_summary(page),
-            "responsabilidad_civil_contractual": read_civil_liability_contractual(page),
             "responsabilidad_civil_extracontractual": read_civil_liability_extracontractual(page),
         }
 
@@ -564,22 +617,19 @@ def row_to_dataframe(row: dict) -> pd.DataFrame:
     """
     Converts one scraped row into a single-row pandas DataFrame.
 
-    informacion_cumplimiento and responsabilidad_civil_contractual are
-    stored as JSON TEXT here (not as native Python dicts), because
-    that's how they need to travel into a JSON/JSONB column, a CSV
-    cell, or an n8n HTTP request body later on.
+    informacion_cumplimiento and responsabilidad_civil_extracontractual
+    are stored as JSON TEXT here (not as native Python dicts/nested
+    structures), because that's how they need to travel into a
+    JSON/JSONB column, a CSV cell, or an n8n HTTP request body later on.
     """
     flat_row = {
         "numero_de_proceso": row["numero_de_proceso"],
         "informacion_cumplimiento": json.dumps(
             row["informacion_cumplimiento"], ensure_ascii=False
         ),
-        "responsabilidad_civil_contractual": json.dumps(
-            row["responsabilidad_civil_contractual"], ensure_ascii=False
+        "responsabilidad_civil_extracontractual": json.dumps(
+            row["responsabilidad_civil_extracontractual"], ensure_ascii=False
         ),
-        "responsabilidad_civil_extracontractual": row[
-            "responsabilidad_civil_extracontractual"
-        ],
     }
     return pd.DataFrame([flat_row])
 
