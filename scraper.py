@@ -484,11 +484,23 @@ def scrape_secop_process(url: str) -> dict:
         # headless specifically, add a virtual display (Xvfb) inside
         # the container instead of reverting this line.
         browser = p.chromium.launch(headless=True)
+        # VPS CHANGE: locale + Accept-Language added. Locally, Windows was
+        # configured in Spanish, so Chrome silently told the SECOP page
+        # "I'm a Spanish-speaking browser" and it replied with Spanish
+        # labels (Cumplimiento del contrato, Pago de salarios, etc). The
+        # VPS container has no such OS-level language setting, so without
+        # this, the page falls back to English and build_compliance_summary
+        # ends up using the English labels as dictionary keys instead -
+        # exactly what you saw (Contract Compliance, Wages payment...).
+        # Setting both locale and the Accept-Language header recreates
+        # that same "Spanish browser" signal on the VPS.
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
+            ),
+            locale="es-CO",
+            extra_http_headers={"Accept-Language": "es-CO,es;q=0.9"},
         )
         page = context.new_page()
 
