@@ -538,75 +538,96 @@ def scrape_secop_process(url: str) -> dict:
         # headless specifically, add a virtual display (Xvfb) inside
         # the container instead of reverting this line.
         browser = p.chromium.launch(headless=True)
-        # VPS CHANGE: locale + Accept-Language added. Locally, Windows was
-        # configured in Spanish, so Chrome silently told the SECOP page
-        # "I'm a Spanish-speaking browser" and it replied with Spanish
-        # labels (Cumplimiento del contrato, Pago de salarios, etc). The
-        # VPS container has no such OS-level language setting, so without
-        # this, the page falls back to English and build_compliance_summary
-        # ends up using the English labels as dictionary keys instead -
-        # exactly what you saw (Contract Compliance, Wages payment...).
-        # Setting both locale and the Accept-Language header recreates
-        # that same "Spanish browser" signal on the VPS.
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="es-CO",
-            extra_http_headers={"Accept-Language": "es-CO,es;q=0.9"},
-        )
-        page = context.new_page()
+        # FIX (file descriptor leak): everything from here on happens
+        # inside try/finally. Before this fix, browser.close() only sat
+        # at the very end of the "happy path" - if page.goto() timed
+        # out, if the recaptcha div was missing, if 2Captcha failed, or
+        # if any selector raised, the function exited straight into
+        # app.py's except block and this browser (plus its context,
+        # page, and every OS-level file descriptor it holds: sockets,
+        # temp profile files, pipes) was simply abandoned in memory.
+        # The process never restarts between n8n calls, so those leaks
+        # accumulated across an entire day's run until the OS ran out
+        # of file descriptors ("Too many open files") - and because the
+        # container itself never restarts between runs either, a bad
+        # run today can start the next run already near that limit.
+        # Wrapping everything in try/finally guarantees close() runs on
+        # every exit path, success or failure.
+        try:
+            # VPS CHANGE: locale + Accept-Language added. Locally, Windows was
+            # configured in Spanish, so Chrome silently told the SECOP page
+            # "I'm a Spanish-speaking browser" and it replied with Spanish
+            # labels (Cumplimiento del contrato, Pago de salarios, etc). The
+            # VPS container has no such OS-level language setting, so without
+            # this, the page falls back to English and build_compliance_summary
+            # ends up using the English labels as dictionary keys instead -
+            # exactly what you saw (Contract Compliance, Wages payment...).
+            # Setting both locale and the Accept-Language header recreates
+            # that same "Spanish browser" signal on the VPS.
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="es-CO",
+                extra_http_headers={"Accept-Language": "es-CO,es;q=0.9"},
+            )
+            page = context.new_page()
 
-        print(f"Opening {url}")
-        page.goto(url, wait_until="networkidle", timeout=60000)
+            print(f"Opening {url}")
+            page.goto(url, wait_until="networkidle", timeout=60000)
 
-        recaptcha_iframe = page.query_selector("iframe[src*='recaptcha']")
+            recaptcha_iframe = page.query_selector("iframe[src*='recaptcha']")
 
-        if recaptcha_iframe:
-            print("Captcha found. Reading its configuration...")
-            captcha_div = page.query_selector("div.g-recaptcha")
-            if captcha_div is None:
-                raise RuntimeError(
-                    "Expected a 'div.g-recaptcha' element but didn't find one. "
-                    "The page's structure may have changed."
-                )
+            if recaptcha_iframe:
+                print("Captcha found. Reading its configuration...")
+                captcha_div = page.query_selector("div.g-recaptcha")
+                if captcha_div is None:
+                    raise RuntimeError(
+                        "Expected a 'div.g-recaptcha' element but didn't find one. "
+                        "The page's structure may have changed."
+                    )
 
-            sitekey = captcha_div.get_attribute("data-sitekey")
-            callback_name = captcha_div.get_attribute("data-callback")
+                sitekey = captcha_div.get_attribute("data-sitekey")
+                callback_name = captcha_div.get_attribute("data-callback")
 
-            token = solve_recaptcha(sitekey, url)
+                token = solve_recaptcha(sitekey, url)
 
-            # Solving the captcha usually makes the site submit a hidden
-            # form and reload/redirect to the real content. We wrap the
-            # unlock step in `expect_navigation` so Playwright waits for
-            # that page change to fully finish before we try to read
-            # anything - otherwise we might try to read data from a page
-            # that hasn't loaded yet.
-            try:
-                with page.expect_navigation(timeout=30000):
-                    unlock_page_with_token(page, token, callback_name)
-            except Exception:
-                # Not every site navigates to a new URL - some just
-                # refresh their content in place. That's fine, we just
-                # continue and wait for the network to settle below.
-                pass
+                # Solving the captcha usually makes the site submit a hidden
+                # form and reload/redirect to the real content. We wrap the
+                # unlock step in `expect_navigation` so Playwright waits for
+                # that page change to fully finish before we try to read
+                # anything - otherwise we might try to read data from a page
+                # that hasn't loaded yet.
+                try:
+                    with page.expect_navigation(timeout=30000):
+                        unlock_page_with_token(page, token, callback_name)
+                except Exception:
+                    # Not every site navigates to a new URL - some just
+                    # refresh their content in place. That's fine, we just
+                    # continue and wait for the network to settle below.
+                    pass
 
-            page.wait_for_load_state("networkidle", timeout=30000)
-        else:
-            print("No captcha on this load - continuing directly.")
+                page.wait_for_load_state("networkidle", timeout=30000)
+            else:
+                print("No captcha on this load - continuing directly.")
 
-        # --- Now that the real content is visible, read everything ---
-        raw_reference = read_text(page, REQUEST_REFERENCE_SELECTOR)
+            # --- Now that the real content is visible, read everything ---
+            raw_reference = read_text(page, REQUEST_REFERENCE_SELECTOR)
 
-        row = {
-            "numero_de_proceso": clean_process_number(raw_reference),
-            "informacion_cumplimiento": build_compliance_summary(page),
-            "responsabilidad_civil_extracontractual": read_civil_liability_extracontractual(page),
-        }
+            row = {
+                "numero_de_proceso": clean_process_number(raw_reference),
+                "informacion_cumplimiento": build_compliance_summary(page),
+                "responsabilidad_civil_extracontractual": read_civil_liability_extracontractual(page),
+            }
 
-        browser.close()
-        return row
+            return row
+        finally:
+            # Runs on every exit path - success, handled exception, or
+            # unhandled exception - so the browser (and every file
+            # descriptor it holds) is always released.
+            browser.close()
+            print("Browser closed.")
 
 
 # ==================================================================
