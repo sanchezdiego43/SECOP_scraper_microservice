@@ -106,9 +106,7 @@ Requirements to run this script:
 NOTES ADDED FOR THE VPS / MICROSERVICE VERSION (read this once):
 --------------------------------------------------------------------
 This file runs inside a Docker container on a VPS, called by app.py
-every time n8n asks for a scrape. Two changes from the original local
-version, each marked with a "VPS CHANGE" comment right above the
-modified line:
+every time n8n asks for a scrape.
 
   1. TWOCAPTCHA_API_KEY is read from an environment variable instead
      of being written directly in the code, so the real secret never
@@ -121,24 +119,61 @@ modified line:
      locally - without it, the page falls back to English and the
      dynamic compliance labels come back in English instead of Spanish.
 
+--------------------------------------------------------------------
+NOTES ADDED FOR THE ASYNC / SHARED-BROWSER REFACTOR (read this once):
+--------------------------------------------------------------------
+Previously, scrape_secop_process(url) launched a brand new Chromium
+PROCESS for every single scrape, using Playwright's sync API. Under
+concurrent requests (n8n's batchSize > 1), FastAPI ran each request in
+its own thread, and each thread's sync_playwright() spun up its own
+asyncio event loop internally. Multiple loops in different threads
+trying to spawn an OS process (Chromium) at the same instant hit a
+known asyncio limitation, surfacing as:
+    "Racing with another loop to spawn a process."
+
+The fix: launch ONE Chromium browser process when the service starts
+(see app.py's lifespan), and reuse it for the entire life of the
+container. Each individual scrape now only opens a lightweight
+BrowserContext (an isolated "session" - its own cookies, no new OS
+process involved) on top of that already-running browser, and closes
+only that context when done - never the shared browser itself.
+
+This requires:
+  - Everything that touches `page` is now `async def` and uses
+    `await`, since a single shared browser across concurrent requests
+    needs Playwright's ASYNC api (playwright.async_api), not the sync
+    one - that's what lets FastAPI juggle multiple scrapes at once
+    inside a single event loop instead of separate competing threads.
+  - scrape_secop_process(url, browser) now RECEIVES the already-running
+    browser as a parameter, instead of launching its own.
+  - solve_recaptcha() used to block with `time.sleep(10)` and the
+    synchronous `requests` library while polling 2Captcha for up to 4
+    minutes. Left unchanged, that would freeze the ENTIRE server (every
+    other in-flight scrape too) for up to 4 minutes on every captcha.
+    It now uses `asyncio.sleep(10)` (a non-blocking wait) and runs the
+    blocking `requests.get(...)` calls inside `asyncio.to_thread(...)`,
+    so waiting on 2Captcha for one request no longer blocks any other
+    concurrent scrape.
+
 TARGET_URL and the `if __name__ == "__main__":` block (including
 row_to_dataframe) are still here, but only matter if you run this
 file by itself on your own computer to test it. Inside the container,
-app.py calls scrape_secop_process(url) directly with the URL n8n
-sent, and returns that dictionary straight back to n8n as JSON - the
-nested dicts inside it (informacion_cumplimiento, etc.) serialize to
-JSON just fine on their own, so row_to_dataframe/pandas is never
-needed for the microservice to work, only for your local testing.
+app.py's lifespan launches the shared browser and calls
+scrape_secop_process(url, browser) directly with the URL n8n sent, and
+returns that dictionary straight back to n8n as JSON - the nested
+dicts inside it (informacion_cumplimiento, etc.) serialize to JSON
+just fine on their own, so row_to_dataframe/pandas is never needed for
+the microservice to work, only for your local testing.
 """
 
+import asyncio
 import json
 import os
 import re
-import time
 
 import pandas as pd
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.async_api import Browser
 
 # ==================================================================
 # CONFIG - things you are likely to change
@@ -153,7 +188,7 @@ TWOCAPTCHA_API_KEY = os.environ.get("TWOCAPTCHA_API_KEY", "")
 # The SECOP process page we want to read.
 # Only used by the __main__ block below, for local testing. Inside the
 # container, app.py passes the real URL from n8n straight into
-# scrape_secop_process(url) instead of using this constant.
+# scrape_secop_process(url, browser) instead of using this constant.
 TARGET_URL = (
     "https://community.secop.gov.co/Public/Tendering/OpportunityDetail/"
     "Index?noticeUID=CO1.NTC.8534047"
@@ -237,7 +272,7 @@ LABEL_EXCLUDED_SUFFIXES = ("StartDate", "EndDate", "Percentage", "Value")
 # STEP 1: Solve the captcha using 2Captcha
 # ==================================================================
 
-def solve_recaptcha(sitekey: str, page_url: str) -> str:
+async def solve_recaptcha(sitekey: str, page_url: str) -> str:
     """
     Talks to the 2Captcha service and returns the solved token.
 
@@ -250,18 +285,31 @@ def solve_recaptcha(sitekey: str, page_url: str) -> str:
         2. We POLL (ask again and again, every 10 seconds): "is job id
            X done yet?". We keep asking until it says yes, or until we
            give up after ~4 minutes.
+
+    ASYNC REFACTOR NOTE: `requests` is a blocking (synchronous)
+    library, and the polling loop below waits up to 4 minutes total.
+    Running that directly inside an `async def` would freeze the
+    entire event loop - and with it, every OTHER concurrent scrape -
+    for as long as this one captcha takes to solve. To avoid that,
+    each blocking requests.get(...) call runs inside
+    `asyncio.to_thread(...)` (which hands it off to a background
+    thread instead of the event loop), and the wait between polls uses
+    `asyncio.sleep(10)` instead of `time.sleep(10)`, so other requests
+    keep making progress while this one waits.
     """
-    submit_resp = requests.get(
-        "https://2captcha.com/in.php",
-        params={
-            "key": TWOCAPTCHA_API_KEY,
-            "method": "userrecaptcha",
-            "googlekey": sitekey,
-            "pageurl": page_url,
-            "json": 1,
-        },
-        timeout=30,
-    ).json()
+    submit_resp = await asyncio.to_thread(
+        lambda: requests.get(
+            "https://2captcha.com/in.php",
+            params={
+                "key": TWOCAPTCHA_API_KEY,
+                "method": "userrecaptcha",
+                "googlekey": sitekey,
+                "pageurl": page_url,
+                "json": 1,
+            },
+            timeout=30,
+        ).json()
+    )
 
     if submit_resp.get("status") != 1:
         raise RuntimeError(f"2Captcha submit error: {submit_resp}")
@@ -271,18 +319,20 @@ def solve_recaptcha(sitekey: str, page_url: str) -> str:
 
     max_attempts = 24  # 24 tries * 10 seconds = up to 4 minutes of waiting
     for attempt in range(max_attempts):
-        time.sleep(10)
+        await asyncio.sleep(10)
 
-        result_resp = requests.get(
-            "https://2captcha.com/res.php",
-            params={
-                "key": TWOCAPTCHA_API_KEY,
-                "action": "get",
-                "id": job_id,
-                "json": 1,
-            },
-            timeout=30,
-        ).json()
+        result_resp = await asyncio.to_thread(
+            lambda: requests.get(
+                "https://2captcha.com/res.php",
+                params={
+                    "key": TWOCAPTCHA_API_KEY,
+                    "action": "get",
+                    "id": job_id,
+                    "json": 1,
+                },
+                timeout=30,
+            ).json()
+        )
 
         if result_resp.get("status") == 1:
             print("[2Captcha] Solved!")
@@ -300,7 +350,7 @@ def solve_recaptcha(sitekey: str, page_url: str) -> str:
 # STEP 2: Hand the solved token back to the page
 # ==================================================================
 
-def unlock_page_with_token(page, token: str, callback_name: str | None) -> None:
+async def unlock_page_with_token(page, token: str, callback_name: str | None) -> None:
     """
     A reCAPTCHA checkbox, when a human clicks it, does two things once
     it gets a valid answer from Google:
@@ -313,7 +363,7 @@ def unlock_page_with_token(page, token: str, callback_name: str | None) -> None:
            don't have to guess it, we just read it directly from the
            page and call it ourselves with our token.
     """
-    page.evaluate(
+    await page.evaluate(
         """(token) => {
             const box = document.getElementById('g-recaptcha-response');
             if (box) {
@@ -328,7 +378,7 @@ def unlock_page_with_token(page, token: str, callback_name: str | None) -> None:
         return
 
     print(f"Calling the page's own callback function: {callback_name}(token)")
-    function_found = page.evaluate(
+    function_found = await page.evaluate(
         """({callbackName, token}) => {
             if (typeof window[callbackName] === 'function') {
                 window[callbackName](token);
@@ -346,7 +396,7 @@ def unlock_page_with_token(page, token: str, callback_name: str | None) -> None:
 # STEP 3: Read pieces of text from the page
 # ==================================================================
 
-def read_text(page, selector: str) -> str | None:
+async def read_text(page, selector: str) -> str | None:
     """
     Reads the text inside whatever HTML element matches `selector`.
 
@@ -355,10 +405,11 @@ def read_text(page, selector: str) -> str | None:
     field filled in (for example, a process with no civil-liability
     insurance simply won't have those numbers anywhere on the page).
     """
-    element = page.query_selector(selector)
+    element = await page.query_selector(selector)
     if element is None:
         return None
-    return element.inner_text().strip()
+    text = await element.inner_text()
+    return text.strip()
 
 
 def clean_process_number(raw_text: str | None) -> str | None:
@@ -385,7 +436,7 @@ def clean_process_number(raw_text: str | None) -> str | None:
     return raw_text.strip()
 
 
-def read_civil_liability_extracontractual(page) -> dict:
+async def read_civil_liability_extracontractual(page) -> dict:
     """
     Reads the "Responsabilidad civil extracontractual" guarantee.
 
@@ -409,7 +460,9 @@ def read_civil_liability_extracontractual(page) -> dict:
             "valores": dict | "N/A",
         }
     """
-    has_civil_liability = page.query_selector(CIVIL_LIABILITY_HAS_IT_SELECTOR) is not None
+    has_civil_liability = (
+        await page.query_selector(CIVIL_LIABILITY_HAS_IT_SELECTOR) is not None
+    )
 
     if not has_civil_liability:
         return {
@@ -420,25 +473,25 @@ def read_civil_liability_extracontractual(page) -> dict:
     valores = {}
 
     # --- Row 1: money value + currency ---
-    value_row = page.query_selector(CIVIL_LIABILITY_VALUE_ROW_SELECTOR)
-    if value_row is not None and value_row.is_visible():
+    value_row = await page.query_selector(CIVIL_LIABILITY_VALUE_ROW_SELECTOR)
+    if value_row is not None and await value_row.is_visible():
         valores["Valor"] = {
-            "valor": read_text(page, CIVIL_LIABILITY_VALUE_FIELD_SELECTOR),
-            "moneda": read_text(page, CIVIL_LIABILITY_VALUE_CURRENCY_SELECTOR),
+            "valor": await read_text(page, CIVIL_LIABILITY_VALUE_FIELD_SELECTOR),
+            "moneda": await read_text(page, CIVIL_LIABILITY_VALUE_CURRENCY_SELECTOR),
         }
 
     # --- Row 2: percentage ---
     # Not implemented yet - the row's existence is detected, but the
     # exact id of the percentage field itself is still unknown (see
     # the TODO next to CIVIL_LIABILITY_PERCENTAGE_ROW_SELECTOR above).
-    # percentage_row = page.query_selector(CIVIL_LIABILITY_PERCENTAGE_ROW_SELECTOR)
-    # if percentage_row is not None and percentage_row.is_visible():
-    #     valores["Porcentaje"] = read_text(page, CIVIL_LIABILITY_PERCENTAGE_FIELD_SELECTOR)
+    # percentage_row = await page.query_selector(CIVIL_LIABILITY_PERCENTAGE_ROW_SELECTOR)
+    # if percentage_row is not None and await percentage_row.is_visible():
+    #     valores["Porcentaje"] = await read_text(page, CIVIL_LIABILITY_PERCENTAGE_FIELD_SELECTOR)
 
     # --- Row 3: number of SMMLV (minimum wages) ---
-    min_wages_row = page.query_selector(CIVIL_LIABILITY_MIN_WAGES_ROW_SELECTOR)
-    if min_wages_row is not None and min_wages_row.is_visible():
-        valores["# de SMMLV"] = read_text(page, CIVIL_LIABILITY_MIN_WAGES_FIELD_SELECTOR)
+    min_wages_row = await page.query_selector(CIVIL_LIABILITY_MIN_WAGES_ROW_SELECTOR)
+    if min_wages_row is not None and await min_wages_row.is_visible():
+        valores["# de SMMLV"] = await read_text(page, CIVIL_LIABILITY_MIN_WAGES_FIELD_SELECTOR)
 
     return {
         "tiene_responsabilidad_civil_extracontractual": "Si",
@@ -446,7 +499,7 @@ def read_civil_liability_extracontractual(page) -> dict:
     }
 
 
-def read_compliance_group(page, group: dict) -> dict:
+async def read_compliance_group(page, group: dict) -> dict:
     """
     Reads one full compliance/guarantee group (label + percentage +
     value) and returns it as:
@@ -476,11 +529,11 @@ def read_compliance_group(page, group: dict) -> dict:
     label_fragment = group["label_fragment"]
     field_fragment = group["field_fragment"]
 
-    candidates = page.query_selector_all(f'[id^="lbl{label_fragment}"]')
+    candidates = await page.query_selector_all(f'[id^="lbl{label_fragment}"]')
 
     label_element = None
     for candidate in candidates:
-        candidate_id = candidate.get_attribute("id") or ""
+        candidate_id = await candidate.get_attribute("id") or ""
         if any(suffix in candidate_id for suffix in LABEL_EXCLUDED_SUFFIXES):
             continue
         label_element = candidate
@@ -489,17 +542,17 @@ def read_compliance_group(page, group: dict) -> dict:
     if label_element is None:
         return {}
 
-    label_text = label_element.inner_text().strip()
+    label_text = (await label_element.inner_text()).strip()
 
     return {
         label_text: {
-            "porcentaje": read_text(page, f"#nbx{field_fragment}PercentageField"),
-            "valor_garantia": read_text(page, f"#nbx{field_fragment}ValueField"),
+            "porcentaje": await read_text(page, f"#nbx{field_fragment}PercentageField"),
+            "valor_garantia": await read_text(page, f"#nbx{field_fragment}ValueField"),
         }
     }
 
 
-def build_compliance_summary(page) -> dict:
+async def build_compliance_summary(page) -> dict:
     """
     Loops over every configured compliance group and merges the
     results into a single nested dictionary, ready to be stored as
@@ -507,15 +560,16 @@ def build_compliance_summary(page) -> dict:
     """
     summary = {}
     for group in COMPLIANCE_GROUPS:
-        summary.update(read_compliance_group(page, group))
+        summary.update(await read_compliance_group(page, group))
     return summary
 
 
 # ==================================================================
-# MAIN FLOW: open the page, unlock it, read everything
+# MAIN FLOW: open a context on the shared browser, unlock it, read
+# everything, close only the context
 # ==================================================================
 
-def scrape_secop_process(url: str) -> dict:
+async def scrape_secop_process(url: str, browser: Browser) -> dict:
     """
     Returns a dictionary shaped exactly like the final database row:
         {
@@ -526,108 +580,94 @@ def scrape_secop_process(url: str) -> dict:
                 "valores": dict | "N/A",
             },
         }
+
+    ASYNC REFACTOR NOTE: `browser` is now a parameter - it's the ONE
+    Chromium instance launched once when the service started (see
+    app.py's lifespan), shared across every concurrent scrape. This
+    function no longer launches or closes a browser process at all -
+    it only opens a new, isolated BrowserContext (cheap: no new OS
+    process, just cookies/session state inside the already-running
+    browser) and closes THAT when done, win or lose. This is what
+    removes the "Racing with another loop to spawn a process" error:
+    the only OS-level process launch happens once, at startup, not
+    once per request.
     """
-    with sync_playwright() as p:
-        # headless=False means "open a real, visible Chrome window".
-        # We keep it visible on purpose: some anti-bot systems behave
-        # more strictly (or block outright) when they detect a browser
-        # running with no visible window at all.
-        # VPS CHANGE: headless=True. The VPS has no screen attached, so
-        # a visible window can't open here - same browser and logic,
-        # just not drawn to a display. If the site ever starts blocking
-        # headless specifically, add a virtual display (Xvfb) inside
-        # the container instead of reverting this line.
-        browser = p.chromium.launch(headless=True)
-        # FIX (file descriptor leak): everything from here on happens
-        # inside try/finally. Before this fix, browser.close() only sat
-        # at the very end of the "happy path" - if page.goto() timed
-        # out, if the recaptcha div was missing, if 2Captcha failed, or
-        # if any selector raised, the function exited straight into
-        # app.py's except block and this browser (plus its context,
-        # page, and every OS-level file descriptor it holds: sockets,
-        # temp profile files, pipes) was simply abandoned in memory.
-        # The process never restarts between n8n calls, so those leaks
-        # accumulated across an entire day's run until the OS ran out
-        # of file descriptors ("Too many open files") - and because the
-        # container itself never restarts between runs either, a bad
-        # run today can start the next run already near that limit.
-        # Wrapping everything in try/finally guarantees close() runs on
-        # every exit path, success or failure.
-        try:
-            # VPS CHANGE: locale + Accept-Language added. Locally, Windows was
-            # configured in Spanish, so Chrome silently told the SECOP page
-            # "I'm a Spanish-speaking browser" and it replied with Spanish
-            # labels (Cumplimiento del contrato, Pago de salarios, etc). The
-            # VPS container has no such OS-level language setting, so without
-            # this, the page falls back to English and build_compliance_summary
-            # ends up using the English labels as dictionary keys instead -
-            # exactly what you saw (Contract Compliance, Wages payment...).
-            # Setting both locale and the Accept-Language header recreates
-            # that same "Spanish browser" signal on the VPS.
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-                locale="es-CO",
-                extra_http_headers={"Accept-Language": "es-CO,es;q=0.9"},
-            )
-            page = context.new_page()
+    # VPS CHANGE: locale + Accept-Language added. Locally, Windows was
+    # configured in Spanish, so Chrome silently told the SECOP page
+    # "I'm a Spanish-speaking browser" and it replied with Spanish
+    # labels (Cumplimiento del contrato, Pago de salarios, etc). The
+    # VPS container has no such OS-level language setting, so without
+    # this, the page falls back to English and build_compliance_summary
+    # ends up using the English labels as dictionary keys instead -
+    # exactly what you saw (Contract Compliance, Wages payment...).
+    # Setting both locale and the Accept-Language header recreates
+    # that same "Spanish browser" signal on the VPS.
+    context = await browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        locale="es-CO",
+        extra_http_headers={"Accept-Language": "es-CO,es;q=0.9"},
+    )
+    # try/finally guarantees the context (and every resource tied to
+    # it) is released whether the scrape succeeds, fails, or times out
+    # partway through - the same protection we added earlier for the
+    # browser itself, now applied at the context level instead, since
+    # the browser is no longer opened/closed per request.
+    try:
+        page = await context.new_page()
 
-            print(f"Opening {url}")
-            page.goto(url, wait_until="networkidle", timeout=60000)
+        print(f"Opening {url}")
+        await page.goto(url, wait_until="networkidle", timeout=60000)
 
-            recaptcha_iframe = page.query_selector("iframe[src*='recaptcha']")
+        recaptcha_iframe = await page.query_selector("iframe[src*='recaptcha']")
 
-            if recaptcha_iframe:
-                print("Captcha found. Reading its configuration...")
-                captcha_div = page.query_selector("div.g-recaptcha")
-                if captcha_div is None:
-                    raise RuntimeError(
-                        "Expected a 'div.g-recaptcha' element but didn't find one. "
-                        "The page's structure may have changed."
-                    )
+        if recaptcha_iframe:
+            print("Captcha found. Reading its configuration...")
+            captcha_div = await page.query_selector("div.g-recaptcha")
+            if captcha_div is None:
+                raise RuntimeError(
+                    "Expected a 'div.g-recaptcha' element but didn't find one. "
+                    "The page's structure may have changed."
+                )
 
-                sitekey = captcha_div.get_attribute("data-sitekey")
-                callback_name = captcha_div.get_attribute("data-callback")
+            sitekey = await captcha_div.get_attribute("data-sitekey")
+            callback_name = await captcha_div.get_attribute("data-callback")
 
-                token = solve_recaptcha(sitekey, url)
+            token = await solve_recaptcha(sitekey, url)
 
-                # Solving the captcha usually makes the site submit a hidden
-                # form and reload/redirect to the real content. We wrap the
-                # unlock step in `expect_navigation` so Playwright waits for
-                # that page change to fully finish before we try to read
-                # anything - otherwise we might try to read data from a page
-                # that hasn't loaded yet.
-                try:
-                    with page.expect_navigation(timeout=30000):
-                        unlock_page_with_token(page, token, callback_name)
-                except Exception:
-                    # Not every site navigates to a new URL - some just
-                    # refresh their content in place. That's fine, we just
-                    # continue and wait for the network to settle below.
-                    pass
+            # Solving the captcha usually makes the site submit a hidden
+            # form and reload/redirect to the real content. We wrap the
+            # unlock step in expect_navigation so Playwright waits for
+            # that page change to fully finish before we try to read
+            # anything - otherwise we might try to read data from a page
+            # that hasn't loaded yet.
+            try:
+                async with page.expect_navigation(timeout=30000):
+                    await unlock_page_with_token(page, token, callback_name)
+            except Exception:
+                # Not every site navigates to a new URL - some just
+                # refresh their content in place. That's fine, we just
+                # continue and wait for the network to settle below.
+                pass
 
-                page.wait_for_load_state("networkidle", timeout=30000)
-            else:
-                print("No captcha on this load - continuing directly.")
+            await page.wait_for_load_state("networkidle", timeout=30000)
+        else:
+            print("No captcha on this load - continuing directly.")
 
-            # --- Now that the real content is visible, read everything ---
-            raw_reference = read_text(page, REQUEST_REFERENCE_SELECTOR)
+        # --- Now that the real content is visible, read everything ---
+        raw_reference = await read_text(page, REQUEST_REFERENCE_SELECTOR)
 
-            row = {
-                "numero_de_proceso": clean_process_number(raw_reference),
-                "informacion_cumplimiento": build_compliance_summary(page),
-                "responsabilidad_civil_extracontractual": read_civil_liability_extracontractual(page),
-            }
+        row = {
+            "numero_de_proceso": clean_process_number(raw_reference),
+            "informacion_cumplimiento": await build_compliance_summary(page),
+            "responsabilidad_civil_extracontractual": await read_civil_liability_extracontractual(page),
+        }
 
-            return row
-        finally:
-            # Runs on every exit path - success, handled exception, or
-            # unhandled exception - so the browser (and every file
-            # descriptor it holds) is always released.
-            browser.close()
-            print("Browser closed.")
+        return row
+    finally:
+        await context.close()
 
 
 # ==================================================================
@@ -655,15 +695,33 @@ def row_to_dataframe(row: dict) -> pd.DataFrame:
     return pd.DataFrame([flat_row])
 
 
-if __name__ == "__main__":
-    # This block only runs if you execute "python scraper.py" directly
-    # on your own computer. Inside the container, app.py (via uvicorn)
-    # is what starts things up, and it calls scrape_secop_process(url)
-    # directly with the URL n8n sent - this block never runs there.
-    result = scrape_secop_process(TARGET_URL)
+async def _run_local_test() -> None:
+    """
+    Local-testing-only helper: launches its own temporary browser
+    (since there's no FastAPI lifespan to share one from when you run
+    this file directly), scrapes TARGET_URL once, and closes it. Only
+    used by the `if __name__ == "__main__":` block below.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            result = await scrape_secop_process(TARGET_URL, browser)
+        finally:
+            await browser.close()
 
     print("\n--- RESULT (row) ---")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
     print("\n--- RESULT (as DataFrame) ---")
     print(row_to_dataframe(result))
+
+
+if __name__ == "__main__":
+    # This block only runs if you execute "python scraper.py" directly
+    # on your own computer. Inside the container, app.py's lifespan
+    # launches the shared browser at startup and calls
+    # scrape_secop_process(url, browser) directly with the URL n8n
+    # sent - this block never runs there.
+    asyncio.run(_run_local_test())
